@@ -11,6 +11,8 @@
 # Folder structure produced:
 #   <destination>/2026-07-12/C0001.MP4
 #                            C0001.MP4.sha256
+#                            C0001M01.XML
+#                            C0001M01.XML.sha256
 #
 # Requires: exiftool (brew install exiftool), shasum (built into macOS)
 # =============================================================================
@@ -51,6 +53,10 @@ count_copied=0
 count_skipped=0
 count_failed=0
 
+# Remove a half-written staging file if the script is interrupted mid-copy
+current_tmp=""
+trap 'if [ -n "$current_tmp" ]; then rm -f "$current_tmp"; fi' EXIT
+
 # ── Progress bar helpers ─────────────────────────────────────────────────────
 # Percentage is tracked by bytes (not file count) since clip sizes vary
 # wildly — a 268MB clip and a 7GB clip shouldn't move the bar equally.
@@ -85,6 +91,57 @@ log() {
   echo -e "$1"
 }
 
+# ── Copy + verify one file ───────────────────────────────────────────────────
+# The source is read only once: tee copies it to a .part staging file while
+# shasum hashes the same stream. The staged copy is re-read to verify, and
+# only renamed into place once its hash matches — the destination never
+# holds an unverified file. Updates the copied/skipped/failed counters.
+ingest_file() {
+  local src="$1" dst_dir="$2" rel="$3"
+  local name dst sha tmp stored_hash src_hash dst_hash
+  name=$(basename "$src")
+  dst="$dst_dir/$name"
+  sha="${dst}.sha256"
+
+  # Skip if already verified
+  if [ -f "$dst" ] && [ -f "$sha" ]; then
+    stored_hash=$(awk '{print $1}' "$sha")
+    dst_hash=$(shasum -a 256 "$dst" | awk '{print $1}')
+    if [ "$stored_hash" = "$dst_hash" ]; then
+      log "${YELLOW}—${NC} Skipping (verified):  $rel/$name"
+      count_skipped=$((count_skipped + 1))
+      return 0
+    fi
+    log "${YELLOW}!${NC} Sidecar exists but checksum mismatch — re-copying: $name"
+  fi
+
+  log "${CYAN}↓${NC} Copying: $name → $rel/"
+  draw_progress
+
+  mkdir -p "$dst_dir"
+  tmp="${dst}.part"
+  current_tmp="$tmp"
+
+  src_hash=$(tee "$tmp" < "$src" | shasum -a 256 | awk '{print $1}')
+  dst_hash=$(shasum -a 256 "$tmp" | awk '{print $1}')
+
+  if [ "$src_hash" = "$dst_hash" ]; then
+    # Preserve original file timestamps, then move into place
+    touch -r "$src" "$tmp"
+    mv "$tmp" "$dst"
+    current_tmp=""
+    # Write sidecar: "<hash>  <filename>" (standard shasum format)
+    echo "$dst_hash  $name" > "$sha"
+    log "${GREEN}✓${NC} Verified:  $rel/$name"
+    count_copied=$((count_copied + 1))
+  else
+    rm -f "$tmp"
+    current_tmp=""
+    log "${RED}✗ CHECKSUM MISMATCH — discarding corrupt copy: $name${NC}"
+    count_failed=$((count_failed + 1))
+  fi
+}
+
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${CYAN}  FX3 Ingest${NC}"
 echo -e "${CYAN}  Source:${NC}      $SRC_DIR"
@@ -105,6 +162,18 @@ if [ "$total_files" -eq 0 ]; then
   exit 0
 fi
 
+# ── Free-space check ─────────────────────────────────────────────────────────
+# Conservative: assumes every file needs copying, so a re-run over a mostly
+# ingested card may over-estimate what's actually needed.
+mkdir -p "$DST_ROOT"
+avail_bytes=$(( $(df -Pk "$DST_ROOT" | awk 'NR==2 {print $4}') * 1024 ))
+if [ "$avail_bytes" -lt "$total_bytes" ]; then
+  echo -e "${RED}Error:${NC} Not enough free space on destination."
+  echo -e "  Needed:    $(human_size "$total_bytes")"
+  echo -e "  Available: $(human_size "$avail_bytes")"
+  exit 1
+fi
+
 draw_progress
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -121,59 +190,30 @@ while IFS= read -r -d '' src_file; do
   # Strip whitespace
   create_date="${create_date//[[:space:]]/}"
 
-  # Fall back to "Unknown" if metadata is missing
+  # Fall back to filesystem mtime, then "Unknown-Date", if metadata is missing
+  if [ -z "$create_date" ]; then
+    create_date=$(stat -f %Sm -t %Y-%m-%d "$src_file" 2>/dev/null || true)
+    [ -n "$create_date" ] && log "${YELLOW}!${NC} No CreateDate metadata — using file mtime: $filename"
+  fi
   [ -z "$create_date" ] && create_date="Unknown-Date"
 
   # Build destination path: <root>/<YYYY-MM-DD>/<filename>
   dst_dir="$DST_ROOT/$create_date"
-  dst_file="$dst_dir/$filename"
-  sha_file="${dst_file}.sha256"
 
-  # ── Skip if already verified ───────────────────────────────────────────────
-  if [ -f "$dst_file" ] && [ -f "$sha_file" ]; then
-    stored_hash=$(awk '{print $1}' "$sha_file")
-    dst_hash=$(shasum -a 256 "$dst_file" | awk '{print $1}')
-    if [ "$stored_hash" = "$dst_hash" ]; then
-      log "${YELLOW}—${NC} Skipping (verified):  $create_date/$filename"
-      count_skipped=$((count_skipped + 1))
-      files_done=$((files_done + 1))
-      bytes_done=$((bytes_done + file_size))
-      draw_progress
-      continue
-    else
-      log "${YELLOW}!${NC} Sidecar exists but checksum mismatch — re-copying: $filename"
-    fi
-  fi
-
-  # ── Checksum source ────────────────────────────────────────────────────────
-  log "${CYAN}↓${NC} Copying: $filename → $create_date/"
-  draw_progress
-  src_hash=$(shasum -a 256 "$src_file" | awk '{print $1}')
-
-  # ── Copy ───────────────────────────────────────────────────────────────────
-  mkdir -p "$dst_dir"
-  cp "$src_file" "$dst_file"
-
-  # Preserve original file timestamps
-  touch -r "$src_file" "$dst_file"
-
-  # ── Verify destination ────────────────────────────────────────────────────
-  dst_hash=$(shasum -a 256 "$dst_file" | awk '{print $1}')
+  ingest_file "$src_file" "$dst_dir" "$create_date"
 
   files_done=$((files_done + 1))
   bytes_done=$((bytes_done + file_size))
-
-  if [ "$src_hash" = "$dst_hash" ]; then
-    # Write sidecar: "<hash>  <filename>" (standard shasum format)
-    echo "$dst_hash  $filename" > "$sha_file"
-    log "${GREEN}✓${NC} Verified:  $create_date/$filename"
-    count_copied=$((count_copied + 1))
-  else
-    log "${RED}✗ CHECKSUM MISMATCH — deleting corrupt copy: $filename${NC}"
-    rm -f "$dst_file"
-    count_failed=$((count_failed + 1))
-  fi
   draw_progress
+
+  # Sony NRT metadata sidecars (e.g. C0001M01.XML for C0001.MP4) ride along
+  # into the clip's date folder. They're ~2KB, so they aren't counted in the
+  # byte-weighted progress totals.
+  base="${filename%.*}"
+  while IFS= read -r -d '' xml_file; do
+    ingest_file "$xml_file" "$dst_dir" "$create_date"
+    draw_progress
+  done < <(find "$(dirname "$src_file")" -maxdepth 1 -iname "${base}M[0-9][0-9].XML" -type f -print0)
 
 done < <(find "$SRC_DIR" -iname "*.mp4" -type f -print0)
 
