@@ -1,0 +1,16 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        # The script is macOS-only at runtime (BSD stat/df), but shellcheck is
+        # static analysis, so a Linux runner is fine.
+        run: shellcheck fx3_ingest.sh

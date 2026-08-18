@@ -1,8 +1,52 @@
 # fx3-ingest
 
+[![shellcheck](https://github.com/jpmontez/fx3-ingest/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/jpmontez/fx3-ingest/actions/workflows/shellcheck.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
+
 A checksum-verified ingest script for offloading Sony FX3 MP4 clips from an
 SD card into a date-organized folder structure, ready for import into
 DaVinci Resolve.
+
+One bash script, no dependencies beyond `exiftool`. It reads the card once,
+files each clip under its true local shooting date, verifies every copy with
+SHA-256, and refuses to overwrite or silently skip a file it hasn't proven is
+identical — so that when it says the ingest is clean, the card really is safe
+to format.
+
+```console
+$ ./fx3_ingest.sh /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP ~/Footage
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FX3 Ingest
+  Source:      /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP
+  Destination: /Users/you/Footage
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✓ Verified:  2026-07-20/C0001.MP4
+✓ Verified:  2026-07-20/C0001M01.XML
+✓ Verified:  2026-07-20/C0002.MP4
+! NO GYRO:   2026-07-20/C0003.MP4  (no rtmd track — not stabilizable in Gyroflow)
+[##############----------------]  47% (7/15 files, 4.2GB/9.8GB)
+```
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Copied & verified:  15
+  Skipped (existing): 0
+  Without gyro data:  1
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Resulting layout:
+
+```
+Footage/
+└── 2026-07-20/
+    ├── C0001.MP4
+    ├── C0001.MP4.sha256
+    ├── C0001M01.XML
+    └── C0001M01.XML.sha256
+```
 
 ## Why
 
@@ -46,21 +90,46 @@ or rename files in ways that conflict with keeping native FX3 filenames
 10. Shows a live, byte-weighted progress bar while it works — and drops the
     colours and the bar automatically when output is piped to a file.
 
+## Install
+
+macOS only — the script uses BSD `stat` and `df` syntax, and refuses to run
+elsewhere. `shasum` ships with macOS; `exiftool` does not:
+
+```bash
+brew install exiftool
+```
+
+Then grab the script — it's a single file, so there's nothing to install:
+
+```bash
+curl -O https://raw.githubusercontent.com/jpmontez/fx3-ingest/main/fx3_ingest.sh
+chmod +x fx3_ingest.sh
+```
+
+Or clone the repo if you'd rather track updates with `git pull`:
+
+```bash
+git clone https://github.com/jpmontez/fx3-ingest.git
+cd fx3-ingest
+```
+
 ## Usage
 
 ```bash
-chmod +x fx3_ingest.sh
 ./fx3_ingest.sh <source_dir> <destination_dir>
 
 # Example:
 ./fx3_ingest.sh /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP /Volumes/MyDrive/Projects/Shoot_Name/Footage
 ```
 
+`--help` lists every flag; `--version` prints the version, which is worth
+including in a bug report.
+
 ### Preview before committing
 
 `--dry-run` prints exactly what would be copied, where, and why, and writes
-nothing. Worth running before an ingest you're going to format the card
-after:
+nothing. **Start here on your first run** — and on any ingest you plan to
+format the card after:
 
 ```bash
 ./fx3_ingest.sh --dry-run /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP ~/Footage
@@ -186,11 +255,6 @@ themselves are populated would need `exiftool -ee`, which walks the whole
 `mdat` — a second full read of every clip, which is exactly what the
 single-read copy exists to avoid.
 
-## Dependencies
-
-- [`exiftool`](https://exiftool.org/) — `brew install exiftool`
-- `shasum` — built into macOS
-
 ## After ingest
 
 Import into DaVinci Resolve and use **Media Pool → right-click → Auto-Bin by
@@ -213,11 +277,13 @@ structure into bins.
   caught rather than structurally prevented.
 - Paths containing tabs or newlines are rejected rather than mishandled.
 
-## Development
+## Contributing
 
-The script is linted with [shellcheck](https://www.shellcheck.net/)
-(`brew install shellcheck`):
+Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+manual test checklist and a heads-up about the two areas of this script that
+have previously caused silent data loss. [`CLAUDE.md`](CLAUDE.md) documents
+the architecture and the reasoning behind the trickier decisions.
 
-```bash
-shellcheck fx3_ingest.sh
-```
+## License
+
+[MIT](LICENSE).
