@@ -21,24 +21,39 @@
 set -euo pipefail
 
 # ── Colours ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Colour
+# Only decorate a real terminal. Piping a run to a log file
+# (`./fx3_ingest.sh ... | tee ingest.log`) should produce plain readable text,
+# not escape codes. IS_TTY also gates the in-place progress bar, which is
+# meaningless in a file; NO_COLOR is honoured separately, since wanting plain
+# output is not the same as not having a terminal.
+if [ -t 1 ]; then IS_TTY=1; else IS_TTY=0; fi
+
+if [ "$IS_TTY" -eq 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'
+  NC='\033[0m' # No Colour
+else
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
+fi
 
 usage() {
   echo -e "${CYAN}Usage:${NC}"
   echo "  $0 [--dry-run] <source_dir> <destination_dir>"
-  echo "  $0 --verify <archive_dir>"
+  echo "  $0 --verify <archive_dir|date_folder|file>"
   echo ""
   echo "  source_dir       SD card clip folder (e.g. /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP)"
   echo "  destination_dir  Project footage root (e.g. /Volumes/MyDrive/Projects/Shoot/Footage)"
   echo ""
   echo "  -n, --dry-run    Show what would be copied, where, and why. Writes nothing."
-  echo "      --verify     Re-hash an existing archive against its .sha256 sidecars"
-  echo "                   and report corruption, missing files, and missing sidecars."
+  echo "      --verify     Re-hash against .sha256 sidecars and report corruption,"
+  echo "                   missing files, and missing sidecars. Takes a whole archive,"
+  echo "                   a single date folder, or one file (or its .sha256)."
   echo "  -h, --help       Show this help."
+  echo ""
+  echo "  Clips with no gyro/IMU track are flagged 'NO GYRO' — those cannot be"
+  echo "  stabilized in Gyroflow. Sony proxy clips and macOS ._* stubs are skipped."
 }
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
@@ -72,6 +87,8 @@ total_files=0
 total_bytes=0
 
 draw_progress() {
+  # An in-place bar redrawn with \r is noise in a redirected log.
+  [ "$IS_TTY" -eq 0 ] && return 0
   [ "$DRY_RUN" -eq 1 ] && return 0
   # Nothing to copy (e.g. a run that only turned up collisions) — a 0/0 bar
   # would just be noise between the error lines.
@@ -89,10 +106,21 @@ draw_progress() {
 }
 
 # Clears the in-place progress bar so a normal log line can print cleanly
-# above it; callers are expected to redraw the bar right after.
+# above it; callers are expected to redraw the bar right after. With no
+# terminal there is no bar to clear, and the escape sequence would just
+# corrupt the log.
 log() {
-  printf "\r\033[K"
+  if [ "$IS_TTY" -eq 1 ]; then
+    printf "\r\033[K"
+  fi
   echo -e "$1"
+}
+
+# Same guard for the standalone bar-clearing calls between sections.
+clear_progress() {
+  if [ "$IS_TTY" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+    printf "\r\033[K"
+  fi
 }
 
 # stat wrappers — BSD/macOS syntax
@@ -108,14 +136,81 @@ file_mtime() { stat -f%m "$1"; }
 # skips (see the fast-skip note in plan_actions).
 if [ "$MODE" = "verify" ]; then
   if [ "${#positional[@]}" -ne 1 ]; then
-    echo -e "${RED}Error:${NC} --verify takes exactly one argument (the archive directory)"
+    echo -e "${RED}Error:${NC} --verify takes exactly one argument (an archive directory, a date folder, or a single file)"
     echo ""
     usage
     exit 1
   fi
-  ARCHIVE="${positional[0]%/}"
+
+  v_ok=0; v_bad=0; v_missing=0; v_nosidecar=0
+
+  # Re-hash one file against its sidecar. Shared by the whole-archive walk and
+  # the single-file path so there is only one copy of the hashing, the
+  # reporting, and the progress accounting.
+  # $3=1 logs successes too. A whole-archive walk stays quiet on success (the
+  # progress bar is the feedback, and one line per file would bury the
+  # failures); a single-file spot check has no bar, so it says so explicitly.
+  verify_sidecar() {
+    local sidecar="$1" root="$2" verbose="${3:-0}"
+    local orig rel stored_hash actual_hash
+    orig="${sidecar%.sha256}"
+    rel="${orig#"$root"/}"
+    if [ ! -f "$orig" ]; then
+      log "${RED}✗${NC} MISSING FILE:   $rel  (sidecar exists, file does not)"
+      v_missing=$((v_missing + 1))
+      draw_progress
+      return 0
+    fi
+    stored_hash=$(awk 'NR==1 {print $1}' "$sidecar")
+    actual_hash=$(shasum -a 256 "$orig" | awk '{print $1}')
+    if [ "$stored_hash" = "$actual_hash" ]; then
+      [ "$verbose" -eq 1 ] && log "${GREEN}✓${NC} OK:             $rel"
+      v_ok=$((v_ok + 1))
+    else
+      log "${RED}✗${NC} CORRUPT:        $rel  (hash does not match sidecar)"
+      v_bad=$((v_bad + 1))
+    fi
+    files_done=$((files_done + 1))
+    bytes_done=$((bytes_done + $(file_size "$orig")))
+    draw_progress
+  }
+
+  TARGET="${positional[0]%/}"
+
+  # ── Single file ────────────────────────────────────────────────────────────
+  # Accept either the file itself or its sidecar; spot-checking one clip
+  # shouldn't require re-hashing the terabytes around it.
+  if [ -f "$TARGET" ]; then
+    case "$TARGET" in
+      *.sha256) SIDECAR="$TARGET" ;;
+      *)        SIDECAR="${TARGET}.sha256" ;;
+    esac
+    if [ ! -f "$SIDECAR" ]; then
+      echo -e "${RED}Error:${NC} No checksum sidecar for this file: $SIDECAR"
+      echo "  Only files ingested by this script have one."
+      exit 1
+    fi
+    ARCHIVE=$(dirname "$SIDECAR")
+
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}  FX3 Verify${NC}"
+    echo -e "${CYAN}  File:${NC} ${SIDECAR%.sha256}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    verify_sidecar "$SIDECAR" "$ARCHIVE" 1
+
+    clear_progress
+    if [ "$v_bad" -gt 0 ] || [ "$v_missing" -gt 0 ]; then
+      exit 1
+    fi
+    exit 0
+  fi
+
+  # ── Whole archive (or one date folder — it's just a directory) ─────────────
+  ARCHIVE="$TARGET"
   if [ ! -d "$ARCHIVE" ]; then
-    echo -e "${RED}Error:${NC} Directory not found: $ARCHIVE"
+    echo -e "${RED}Error:${NC} Not found: $ARCHIVE"
     exit 1
   fi
 
@@ -124,8 +219,6 @@ if [ "$MODE" = "verify" ]; then
   echo -e "${CYAN}  Archive:${NC} $ARCHIVE"
   echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
-
-  v_ok=0; v_bad=0; v_missing=0; v_nosidecar=0
 
   # Pre-scan for progress totals: bytes of every file that has a sidecar.
   while IFS= read -r -d '' sidecar; do
@@ -139,25 +232,7 @@ if [ "$MODE" = "verify" ]; then
   draw_progress
 
   while IFS= read -r -d '' sidecar; do
-    orig="${sidecar%.sha256}"
-    rel="${orig#"$ARCHIVE"/}"
-    if [ ! -f "$orig" ]; then
-      log "${RED}✗${NC} MISSING FILE:   $rel  (sidecar exists, file does not)"
-      v_missing=$((v_missing + 1))
-      draw_progress
-      continue
-    fi
-    stored_hash=$(awk 'NR==1 {print $1}' "$sidecar")
-    actual_hash=$(shasum -a 256 "$orig" | awk '{print $1}')
-    if [ "$stored_hash" = "$actual_hash" ]; then
-      v_ok=$((v_ok + 1))
-    else
-      log "${RED}✗${NC} CORRUPT:        $rel  (hash does not match sidecar)"
-      v_bad=$((v_bad + 1))
-    fi
-    files_done=$((files_done + 1))
-    bytes_done=$((bytes_done + $(file_size "$orig")))
-    draw_progress
+    verify_sidecar "$sidecar" "$ARCHIVE"
   done < <(find "$ARCHIVE" -name "*.sha256" -type f -print0 | sort -z)
 
   # Files in the archive that never got a sidecar written. macOS scatters
@@ -173,7 +248,7 @@ if [ "$MODE" = "verify" ]; then
     fi
   done < <(find "$ARCHIVE" -type f -print0 | sort -z)
 
-  printf "\r\033[K"
+  clear_progress
   echo ""
   echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e "  ${GREEN}Verified OK:${NC}        $v_ok"
@@ -215,6 +290,8 @@ count_copied=0
 count_skipped=0
 count_failed=0
 count_collision=0
+count_dupe=0
+count_nogyro=0
 
 # Scratch dir for the plan file and exiftool argfile. Also holds the path of
 # the in-flight staging file so an interrupt can clean it up.
@@ -243,6 +320,11 @@ echo ""
 # ── Collect source clips ─────────────────────────────────────────────────────
 # One walk of the card, reused for the date lookup, the plan, and the copy —
 # so the card is never scanned twice and can't change between passes.
+#
+# `! -name "._*"` drops AppleDouble stubs: on an exFAT card that macOS has
+# touched, `._C0001.MP4` matches *.mp4 and would otherwise be ingested as a
+# clip, complete with its own date folder and checksum sidecar.
+count_proxy=0
 src_files=()
 while IFS= read -r -d '' f; do
   # The plan file is tab-separated and the exiftool argfile is newline-
@@ -254,12 +336,33 @@ while IFS= read -r -d '' f; do
       exit 1
       ;;
   esac
+
+  # Sony proxy clips (PRIVATE/M4ROOT/SUB/C0001S01.MP4). Low-res stand-ins that
+  # carry no usable gyro data and would sit alongside the originals in Resolve
+  # looking like real clips. Only reachable when pointed at the card root
+  # rather than CLIP/, but the walk is recursive, so it is reachable. Matching
+  # the full C####S## shape rather than a bare *S## suffix avoids
+  # misclassifying a legitimately named clip.
+  case "$f" in
+    */SUB/*|*/[Cc][0-9][0-9][0-9][0-9][Ss][0-9][0-9].[Mm][Pp]4)
+      count_proxy=$((count_proxy + 1))
+      continue
+      ;;
+  esac
+
   src_files+=("$f")
-done < <(find "$SRC_DIR" -iname "*.mp4" -type f -print0 | sort -z)
+done < <(find "$SRC_DIR" -iname "*.mp4" -type f ! -name "._*" -print0 | sort -z)
 
 if [ "${#src_files[@]}" -eq 0 ]; then
   echo -e "${YELLOW}No .MP4 files found in $SRC_DIR${NC}"
+  [ "$count_proxy" -gt 0 ] && \
+    echo -e "${YELLOW}($count_proxy proxy clip(s) found and skipped — proxies are not ingested.)${NC}"
   exit 0
+fi
+
+if [ "$count_proxy" -gt 0 ]; then
+  echo -e "${YELLOW}!${NC} Skipping $count_proxy Sony proxy clip(s) — proxies carry no gyro data."
+  echo ""
 fi
 
 # ── Resolve each clip's shooting date ────────────────────────────────────────
@@ -275,15 +378,24 @@ fi
 #   4. "Unknown-Date".
 # One batched exiftool call for the whole card: exiftool costs ~0.5s of perl
 # startup per invocation, which dominated ingest time on a large card.
+#
+# MetaFormat rides along in the same call for gyro detection. The FX3's
+# gyro/IMU data lives in the 'rtmd' timed metadata track inside the MP4, which
+# is what Gyroflow reads. MetaFormat is stored in the sample description box
+# in 'moov', so asking for it is free — no -ee, no extra pass over the card.
+# (The deep check, `-ee -PitchRollYaw`, walks the mdat and would mean a second
+# full read of every clip, which is exactly what the tee-based single-read
+# copy exists to avoid.)
 printf '%s\n' "${src_files[@]}" > "$ARGFILE"
 
 exif_out="$WORK_DIR/dates.tsv"
 exiftool -q -q -m -f -T -api QuickTimeUTC=1 -d '%Y-%m-%d' \
-  -CreationDateValue -CreateDate -@ "$ARGFILE" > "$exif_out" 2>/dev/null || true
+  -CreationDateValue -CreateDate -MetaFormat -@ "$ARGFILE" > "$exif_out" 2>/dev/null || true
 
 # Read the results back in argfile order (exiftool -T preserves it).
 dates=()
-while IFS=$'\t' read -r nrt_date qt_date; do
+gyro=()
+while IFS=$'\t' read -r nrt_date qt_date meta_format; do
   if [ -n "$nrt_date" ] && [ "$nrt_date" != "-" ]; then
     dates+=("$nrt_date")
   elif [ -n "$qt_date" ] && [ "$qt_date" != "-" ]; then
@@ -291,22 +403,38 @@ while IFS=$'\t' read -r nrt_date qt_date; do
   else
     dates+=("")
   fi
+
+  # A clip has several tracks, so -T joins their MetaFormat values with ", "
+  # (e.g. "tmcd, rtmd") — hence a substring test, not equality.
+  case "$meta_format" in
+    *rtmd*) gyro+=("yes") ;;
+    *)      gyro+=("no")  ;;
+  esac
 done < "$exif_out"
 
-# If exiftool bailed entirely, fall back to per-file resolution below.
+# If exiftool bailed entirely, fall back to per-file resolution below. Gyro
+# state is unknown in that case rather than absent — don't cry wolf.
 while [ "${#dates[@]}" -lt "${#src_files[@]}" ]; do
   dates+=("")
 done
+while [ "${#gyro[@]}" -lt "${#src_files[@]}" ]; do
+  gyro+=("unknown")
+done
 
 # ── Build the plan ───────────────────────────────────────────────────────────
-# Each line: <action>\t<src>\t<dst_dir>\t<size>\t<reason>
+# Each line: <action>\t<src>\t<dst_dir>\t<size>\t<mtime>\t<gyro>\t<reason>
+# `reason` is last because it is the only free-text field.
 # Deciding everything up front means the free-space check and the progress bar
 # both reflect the work that will actually happen, not a worst case.
 
 # Decide what to do with one source file relative to its destination.
 #   COPY      — not present, or present but incomplete (no sidecar)
 #   SKIP      — same file already ingested (size + mtime match)
-#   COLLISION — a *different* file already occupies that name
+#   DUPLICATE — an identical source file earlier in this same plan already
+#               covers this destination path (assigned by the pass below,
+#               never here — this function sees one file at a time)
+#   COLLISION — a *different* file already occupies that name, either in the
+#               destination or elsewhere in this same plan
 #
 # The skip test compares the source against the destination. The previous
 # version compared the destination against its own sidecar, which always
@@ -318,7 +446,7 @@ done
 # ingested file is therefore not caught during ingest — that is what
 # `--verify` is for.
 plan_actions() {
-  local src="$1" dst_dir="$2"
+  local src="$1" dst_dir="$2" has_gyro="$3"
   local name dst sha size mtime dst_size dst_mtime action reason
   name=$(basename "$src")
   dst="$dst_dir/$name"
@@ -340,13 +468,15 @@ plan_actions() {
     fi
   fi
 
-  printf '%s\t%s\t%s\t%s\t%s\n' "$action" "$src" "$dst_dir" "$size" "$reason"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$action" "$src" "$dst_dir" "$size" "$mtime" "$has_gyro" "$reason"
 }
 
 : > "$PLAN"
 i=0
 for src_file in "${src_files[@]}"; do
   create_date="${dates[$i]}"
+  has_gyro="${gyro[$i]}"
   i=$((i + 1))
 
   create_date="${create_date//[[:space:]]/}"
@@ -359,23 +489,82 @@ for src_file in "${src_files[@]}"; do
   [ -z "$create_date" ] && create_date="Unknown-Date"
 
   dst_dir="$DST_ROOT/$create_date"
-  plan_actions "$src_file" "$dst_dir" >> "$PLAN"
+  plan_actions "$src_file" "$dst_dir" "$has_gyro" >> "$PLAN"
 
   # Sony NRT metadata sidecars (e.g. C0001M01.XML for C0001.MP4) ride along
-  # into the clip's date folder.
+  # into the clip's date folder. These are 'nrtm' — Non-Real Time Metadata —
+  # and contain no gyro, so the gyro column is "-" rather than "no".
   filename=$(basename "$src_file")
   base="${filename%.*}"
   while IFS= read -r -d '' xml_file; do
-    plan_actions "$xml_file" "$dst_dir" >> "$PLAN"
-  done < <(find "$(dirname "$src_file")" -maxdepth 1 -iname "${base}M[0-9][0-9].XML" -type f -print0 | sort -z)
+    plan_actions "$xml_file" "$dst_dir" "-" >> "$PLAN"
+  done < <(find "$(dirname "$src_file")" -maxdepth 1 -iname "${base}M[0-9][0-9].XML" -type f ! -name "._*" -print0 | sort -z)
 done
 
+# ── Resolve collisions *within* the plan ─────────────────────────────────────
+# plan_actions compares each source against the destination on disk, one file
+# at a time. It cannot see that two different source files are heading for the
+# same destination path — which happens whenever one source tree holds two
+# card dumps, since FX3 cards restart at C0001.MP4 after a format. Before this
+# pass, both were planned COPY and the second silently overwrote the first,
+# reporting "Copied & verified: 2" with one file on disk and exiting 0.
+#
+#   differing size/mtime → COLLISION for every member, nothing is copied
+#   identical size/mtime → the first is copied, the rest become DUPLICATE
+#
+# The identical case is a card and a backup of it under one parent: the same
+# clip reached twice, so copying it once loses nothing and is not an error.
+# Sameness is size + mtime, the same rule as the cross-run fast path above.
+#
+# awk, not bash: this needs associative arrays, which system bash 3.2 lacks.
+awk -F'\t' -v OFS='\t' '
+  # Pass 1: group by destination path and decide which groups conflict.
+  NR == FNR {
+    if ($1 != "COLLISION") {
+      n = split($2, parts, "/")
+      key = $3 "/" parts[n]
+      count[key]++
+      sig = $4 SUBSEP $5
+      if (count[key] == 1) {
+        first_sig[key] = sig
+        first_src[key] = $2
+      } else if (sig != first_sig[key]) {
+        conflict[key] = 1
+      }
+    }
+    next
+  }
+  # Pass 2: rewrite the actions we just decided.
+  {
+    if ($1 != "COLLISION") {
+      n = split($2, parts, "/")
+      key = $3 "/" parts[n]
+      seen[key]++
+      if (conflict[key]) {
+        $1 = "COLLISION"
+        $7 = count[key] " source files map to this path"
+      } else if (seen[key] > 1) {
+        $1 = "DUPLICATE"
+        $7 = "identical to " first_src[key]
+      }
+    }
+    print
+  }
+' "$PLAN" "$PLAN" > "$PLAN.new"
+mv "$PLAN.new" "$PLAN"
+
 # ── Plan totals ──────────────────────────────────────────────────────────────
-plan_copy=0; plan_skip=0; plan_collide=0; copy_bytes=0
-while IFS=$'\t' read -r action src dst_dir size reason; do
+# DUPLICATE deliberately contributes no bytes: the free-space check and the
+# progress bar must reflect only work that will actually happen.
+plan_copy=0; plan_skip=0; plan_dupe=0; plan_collide=0; copy_bytes=0; plan_nogyro=0
+while IFS=$'\t' read -r action src dst_dir size mtime has_gyro reason; do
   case "$action" in
-    COPY)      plan_copy=$((plan_copy + 1));       copy_bytes=$((copy_bytes + size)) ;;
+    COPY)
+      plan_copy=$((plan_copy + 1)); copy_bytes=$((copy_bytes + size))
+      if [ "$has_gyro" = "no" ]; then plan_nogyro=$((plan_nogyro + 1)); fi
+      ;;
     SKIP)      plan_skip=$((plan_skip + 1)) ;;
+    DUPLICATE) plan_dupe=$((plan_dupe + 1)) ;;
     COLLISION) plan_collide=$((plan_collide + 1)) ;;
   esac
 done < "$PLAN"
@@ -383,29 +572,89 @@ done < "$PLAN"
 total_files="$plan_copy"
 total_bytes="$copy_bytes"
 
+# Print each set of source files fighting over one destination path, so the
+# report names every path involved rather than burying them in a per-line
+# reason. Only fires for intra-plan conflicts; a source-vs-destination
+# collision already carries its own self-contained explanation.
+report_collision_groups() {
+  awk -F'\t' -v dst_root="$DST_ROOT" '
+    $1 == "COLLISION" && $7 ~ / source files map to this path$/ {
+      n = split($2, parts, "/")
+      key = $3 "/" parts[n]
+      name[key] = parts[n]
+      # Strip the destination root by length, not sub() — a project path
+      # containing regex metacharacters (Footage[v2], Shoot.2026) would
+      # otherwise be treated as a pattern and strip the wrong thing.
+      rel = $3
+      prefix = dst_root "/"
+      if (substr(rel, 1, length(prefix)) == prefix) {
+        rel = substr(rel, length(prefix) + 1)
+      }
+      folder[key] = rel
+      if (!(key in srcs)) { order[++nkeys] = key }
+      srcs[key] = srcs[key] sprintf("             %s  (%sB)\n", $2, $4)
+    }
+    END {
+      for (i = 1; i <= nkeys; i++) {
+        k = order[i]
+        printf "%-10s %-14s → %s/\n", "COLLISION", name[k], folder[k]
+        printf "           two or more source files map to this path:\n"
+        printf "%s", srcs[k]
+        printf "           Ingest each card into its own destination folder.\n"
+      }
+    }
+  ' "$PLAN"
+}
+
 # ── Dry run: print the plan and stop ─────────────────────────────────────────
 if [ "$DRY_RUN" -eq 1 ]; then
-  while IFS=$'\t' read -r action src dst_dir size reason; do
+  while IFS=$'\t' read -r action src dst_dir size mtime has_gyro reason; do
     name=$(basename "$src")
     rel="${dst_dir#"$DST_ROOT"/}"
     case "$action" in
       COPY)
-        printf "${GREEN}%-10s${NC} %-14s → %s/  %s\n" "COPY" "$name" "$rel" "$(human_size "$size")"
+        if [ "$has_gyro" = "no" ]; then
+          printf "${GREEN}%-10s${NC} %-14s → %s/  %s  ${YELLOW}(no gyro)${NC}\n" \
+            "COPY" "$name" "$rel" "$(human_size "$size")"
+        else
+          printf "${GREEN}%-10s${NC} %-14s → %s/  %s\n" "COPY" "$name" "$rel" "$(human_size "$size")"
+        fi
         ;;
       SKIP)
         printf "${YELLOW}%-10s${NC} %-14s → %s/  (%s)\n" "SKIP" "$name" "$rel" "$reason"
         ;;
+      DUPLICATE)
+        printf "${YELLOW}%-10s${NC} %-14s → %s/  (%s)\n" "DUPLICATE" "$name" "$rel" "$reason"
+        ;;
       COLLISION)
-        printf "${RED}%-10s${NC} %-14s → %s/\n" "COLLISION" "$name" "$rel"
-        printf "           %s\n" "$reason"
+        # Intra-plan collisions are printed as grouped blocks below, so only
+        # the source-vs-destination kind is reported per file here.
+        case "$reason" in
+          *" source files map to this path") ;;
+          *)
+            printf "${RED}%-10s${NC} %-14s → %s/\n" "COLLISION" "$name" "$rel"
+            printf "           %s\n" "$reason"
+            ;;
+        esac
         ;;
     esac
   done < "$PLAN"
+
+  # Intra-plan collisions print as grouped blocks after the per-file lines.
+  # Capture first: there may be collisions but no *intra-plan* ones, in which
+  # case this produces nothing and must not emit stray colour codes.
+  groups=$(report_collision_groups)
+  if [ -n "$groups" ]; then
+    printf "%b%s%b\n" "$RED" "$groups" "$NC"
+  fi
 
   echo ""
   echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo -e "  ${GREEN}Would copy:${NC}         $plan_copy  ($(human_size "$copy_bytes"))"
   echo -e "  ${YELLOW}Would skip:${NC}         $plan_skip"
+  [ "$plan_dupe" -gt 0 ]    && echo -e "  ${YELLOW}Duplicate sources:${NC}  $plan_dupe"
+  [ "$plan_nogyro" -gt 0 ]  && echo -e "  ${YELLOW}Without gyro data:${NC}  $plan_nogyro"
+  [ "$count_proxy" -gt 0 ]  && echo -e "  ${YELLOW}Proxies skipped:${NC}    $count_proxy"
   [ "$plan_collide" -gt 0 ] && echo -e "  ${RED}Collisions:${NC}         $plan_collide"
   echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   [ "$plan_collide" -gt 0 ] && exit 1
@@ -434,7 +683,7 @@ fi
 # only renamed into place once its hash matches — the destination never
 # holds an unverified file.
 ingest_file() {
-  local src="$1" dst_dir="$2" rel="$3"
+  local src="$1" dst_dir="$2" rel="$3" has_gyro="$4"
   local name dst sha tmp src_hash dst_hash
 
   name=$(basename "$src")
@@ -477,6 +726,14 @@ ingest_file() {
     echo "$dst_hash  $name" > "$sha"
     log "${GREEN}✓${NC} Verified:  $rel/$name"
     count_copied=$((count_copied + 1))
+    # Flagged now, while the card is still in the reader. Discovering after a
+    # format that a clip can't be stabilised is unrecoverable. Informational
+    # only — a clip shot in a mode without IMU data is not an ingest failure,
+    # so this must never touch the exit code.
+    if [ "$has_gyro" = "no" ]; then
+      log "${YELLOW}!${NC} NO GYRO:   $rel/$name  (no rtmd track — not stabilizable in Gyroflow)"
+      count_nogyro=$((count_nogyro + 1))
+    fi
   else
     rm -f "$tmp"
     current_tmp=""
@@ -486,9 +743,16 @@ ingest_file() {
 }
 
 # ── Execute the plan ─────────────────────────────────────────────────────────
+# Intra-plan collisions are reported once, up front, as grouped blocks naming
+# every source path involved — repeating that per member would be noise.
+groups=$(report_collision_groups)
+if [ -n "$groups" ]; then
+  printf "%b%s%b\n\n" "$RED" "$groups" "$NC"
+fi
+
 draw_progress
 
-while IFS=$'\t' read -r action src dst_dir size reason; do
+while IFS=$'\t' read -r action src dst_dir size mtime has_gyro reason; do
   rel="${dst_dir#"$DST_ROOT"/}"
   name=$(basename "$src")
   case "$action" in
@@ -496,16 +760,28 @@ while IFS=$'\t' read -r action src dst_dir size reason; do
       log "${YELLOW}—${NC} Skipping (already ingested):  $rel/$name"
       count_skipped=$((count_skipped + 1))
       ;;
-    COLLISION)
-      log "${RED}✗ NAME COLLISION — not copied: $name${NC}"
+    DUPLICATE)
+      log "${YELLOW}—${NC} Skipping (duplicate source):  $rel/$name"
       log "    $reason"
-      log "    Source: $src"
-      log "    Both clips are named $name but are not the same file. Ingest the"
-      log "    second card into a different destination folder, or rename one."
+      count_dupe=$((count_dupe + 1))
+      ;;
+    COLLISION)
+      case "$reason" in
+        *" source files map to this path")
+          # Already covered by the grouped block above; just count it.
+          ;;
+        *)
+          log "${RED}✗ NAME COLLISION — not copied: $name${NC}"
+          log "    $reason"
+          log "    Source: $src"
+          log "    Both clips are named $name but are not the same file. Ingest the"
+          log "    second card into a different destination folder, or rename one."
+          ;;
+      esac
       count_collision=$((count_collision + 1))
       ;;
     COPY)
-      ingest_file "$src" "$dst_dir" "$rel"
+      ingest_file "$src" "$dst_dir" "$rel" "$has_gyro"
       files_done=$((files_done + 1))
       bytes_done=$((bytes_done + size))
       ;;
@@ -513,13 +789,26 @@ while IFS=$'\t' read -r action src dst_dir size reason; do
   draw_progress
 done < "$PLAN"
 
-printf "\n"
+clear_progress
+# Terminate the progress bar's line — but only if there was one.
+if [ "$IS_TTY" -eq 1 ] && [ "$total_files" -gt 0 ]; then
+  printf "\n"
+fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "  ${GREEN}Copied & verified:${NC}  $count_copied"
 echo -e "  ${YELLOW}Skipped (existing):${NC} $count_skipped"
+if [ "$count_dupe" -gt 0 ]; then
+  echo -e "  ${YELLOW}Duplicate sources:${NC}  $count_dupe"
+fi
+if [ "$count_nogyro" -gt 0 ]; then
+  echo -e "  ${YELLOW}Without gyro data:${NC}  $count_nogyro"
+fi
+if [ "$count_proxy" -gt 0 ]; then
+  echo -e "  ${YELLOW}Proxies skipped:${NC}    $count_proxy"
+fi
 if [ "$count_collision" -gt 0 ]; then
   echo -e "  ${RED}Name collisions:${NC}    $count_collision  ${RED}(NOT copied)${NC}"
 fi
