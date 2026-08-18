@@ -20,6 +20,8 @@
 
 set -euo pipefail
 
+FX3_INGEST_VERSION="1.0.0"
+
 # ── Colours ──────────────────────────────────────────────────────────────────
 # Only decorate a real terminal. Piping a run to a log file
 # (`./fx3_ingest.sh ... | tee ingest.log`) should produce plain readable text,
@@ -39,6 +41,8 @@ else
 fi
 
 usage() {
+  echo -e "${CYAN}fx3_ingest.sh${NC} v$FX3_INGEST_VERSION"
+  echo ""
   echo -e "${CYAN}Usage:${NC}"
   echo "  $0 [--dry-run] <source_dir> <destination_dir>"
   echo "  $0 --verify <archive_dir|date_folder|file>"
@@ -50,6 +54,7 @@ usage() {
   echo "      --verify     Re-hash against .sha256 sidecars and report corruption,"
   echo "                   missing files, and missing sidecars. Takes a whole archive,"
   echo "                   a single date folder, or one file (or its .sha256)."
+  echo "  -V, --version    Print the version and exit."
   echo "  -h, --help       Show this help."
   echo ""
   echo "  Clips with no gyro/IMU track are flagged 'NO GYRO' — those cannot be"
@@ -66,11 +71,21 @@ while [ "$#" -gt 0 ]; do
     -n|--dry-run) DRY_RUN=1; shift ;;
     --verify)     MODE="verify"; shift ;;
     -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "fx3_ingest.sh $FX3_INGEST_VERSION"; exit 0 ;;
     --)           shift; while [ "$#" -gt 0 ]; do positional+=("$1"); shift; done ;;
     -*)           echo -e "${RED}Error:${NC} Unknown option: $1"; echo ""; usage; exit 1 ;;
     *)            positional+=("$1"); shift ;;
   esac
 done
+
+# ── Platform guard ───────────────────────────────────────────────────────────
+# BSD-only syntax is used throughout (stat -f %Sm, df -Pk), in both ingest and
+# verify. On Linux those fail deep into a run with cryptic errors rather than
+# at the start, so refuse honestly up front instead.
+if [ "$(uname)" != "Darwin" ]; then
+  echo -e "${RED}Error:${NC} fx3_ingest.sh is macOS-only (it uses BSD stat and df syntax)."
+  exit 1
+fi
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
 human_size() {
@@ -281,7 +296,8 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 if ! command -v exiftool &>/dev/null; then
-  echo -e "${RED}Error:${NC} exiftool not found. Install with: brew install exiftool"
+  echo -e "${RED}Error:${NC} exiftool not found."
+  echo "  Install with: brew install exiftool  (or see https://exiftool.org/)"
   exit 1
 fi
 

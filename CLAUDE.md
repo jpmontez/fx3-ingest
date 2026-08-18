@@ -2,14 +2,14 @@
 
 ## Context
 
-The user shoots on a Sony FX3 and needed a way to offload MP4 clips from an SD
-card onto a MacBook Pro in an organized fashion, so that bins in the video
-editor (DaVinci Resolve) aren't a mess on import.
+This script offloads MP4 clips from a Sony FX3's SD card onto a Mac in an
+organized, checksum-verified fashion, so that bins in the video editor
+(DaVinci Resolve) aren't a mess on import.
 
 ### Background / tools evaluated
 
-- **Offshoot by Hedge** — previously used, but the owned license is
-  incompatible with the current macOS version.
+- **Offshoot by Hedge** — the obvious commercial answer, but an owned
+  license can be incompatible with the current macOS version.
 - **DaVinci Resolve's Clone tool** (Media page) — does verified/checksummed
   copying, but is a flat copy with no metadata-derived folder templating.
   Resolve *can* auto-bin on import by mirroring folder structure, so this
@@ -96,7 +96,7 @@ precisely because it needs associative arrays that bash 3.2 doesn't have.
 
 QuickTime `CreateDate` in an MP4 is stored in **UTC**. Reading it directly —
 which the original version did — files anything shot after ~19:00 local into
-the next day's folder. This misfiled 8 of 9 clips in the user's real archive
+the next day's folder. This misfiled 8 of 9 clips in a real archive
 before being caught, splitting one evening shoot across two folders.
 
 Order of preference, all in a single batched exiftool call:
@@ -124,13 +124,13 @@ always matched, so the second card's clips were reported "Skipping
 (verified)" and never copied, with exit 0. The check must compare **source
 vs. destination**.
 
-**Bug 2 — sources never compared against each other (fixed here).**
+**Bug 2 — sources never compared against each other (fixed in `abdbcd2`).**
 `plan_actions` examines one source file at a time against the destination on
 disk, so when one source tree held two different `C0001.MP4`s heading for the
 same date folder, both were planned `COPY` and the second overwrote the
 first. Confirmed repro: two dirs each with a different `C0001.MP4` and the
 same mtime reported `Copied & verified: 2`, left one file on disk, and exited
-**0** — i.e. it actively told the user the card was safe to format.
+**0** — i.e. it actively told the operator the card was safe to format.
 
 Resolution now happens in the `awk` intra-plan pass, keyed on
 `dst_dir/basename`:
@@ -177,9 +177,9 @@ data is not an ingest failure, and conflating the two would corrupt the
 "safe to format the card" meaning of exit 0.
 
 Tag names were verified against exiftool 13.55 (`Sony.pm:10837-10847`,
-`QuickTime.pm:7762`) but **not yet against a real FX3 clip** — no footage was
-on hand. Confirm with `exiftool -T -MetaFormat <clip>` on real media before
-trusting the flag.
+`QuickTime.pm:7762`) and confirmed against real FX3 footage: normally-shot
+clips carry `rtmd` and are not flagged. Spot-check with
+`exiftool -T -MetaFormat <clip>` if the flag ever looks wrong.
 
 ### Usage
 
@@ -190,6 +190,7 @@ chmod +x fx3_ingest.sh
 ./fx3_ingest.sh --verify <archive_dir>                     # re-hash a whole archive
 ./fx3_ingest.sh --verify <archive_dir>/2026-07-20          # one date folder
 ./fx3_ingest.sh --verify <archive_dir>/2026-07-20/C0001.MP4  # one clip (or its .sha256)
+./fx3_ingest.sh --version                                  # print version
 
 # Example:
 ./fx3_ingest.sh /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP /Volumes/MyDrive/Projects/Shoot_Name/Footage
@@ -204,18 +205,14 @@ documented `shasum -a 256 -c /path/to/clip.MP4.sha256` does not work:
 cd /path/to/2026-07-20 && shasum -a 256 -c C0001.MP4.sha256
 ```
 
-### Archive migration (completed 2026-07-27)
+### Re-filing an archive built before the timezone fix
 
-A one-off `refile_archive.sh` was written to correct archives created before
-the timezone fix, and applied to `~/Movies/Projects`: 8 of 9 clips re-filed,
-32 files moved, all re-verified against their checksums. The script was then
-deleted at the user's request — don't go looking for it in git history, it was
-never committed.
-
-If another pre-fix archive turns up (e.g. on an external project drive that
-wasn't mounted at the time), it will need re-filing: move each clip together
-with its `.XML` and `.sha256` sidecars into the folder matching its
-`CreationDateValue` date, then confirm with `--verify`.
+Archives ingested before the UTC fix (commit `aad61f1`) have evening clips
+filed one day late. Correcting one means moving each clip together with its
+`.XML` and `.sha256` sidecars into the folder matching its
+`CreationDateValue` date, then confirming the result with `--verify`. This
+was done once, with a throwaway script that was not committed; if it needs
+doing again, `--verify` is what proves the move was clean.
 
 ### Dependencies
 
@@ -224,11 +221,13 @@ with its `.XML` and `.sha256` sidecars into the folder matching its
 
 ### Development conventions
 
-- The repo is local-only: no CI, no test suite (the user explicitly
-  declined GitHub Actions and a smoke-test harness). Lint locally with
-  `shellcheck fx3_ingest.sh` (already installed via Homebrew) before
-  committing, and keep README.md / CLAUDE.md in sync with script changes.
-- No automated tests by choice, so exercise changes by hand against a
+- CI runs `shellcheck` only (`.github/workflows/shellcheck.yml`). There is
+  no automated test suite by choice — the script's real behaviour is about
+  filesystem state, mtimes, and interrupted copies, which is awkward to fake
+  and easy to fake wrongly. Lint locally before committing
+  (`shellcheck fx3_ingest.sh`), and keep README.md / CLAUDE.md / CONTRIBUTING.md
+  in sync with script changes.
+- Since there are no automated tests, exercise changes by hand against a
   scratch source/destination:
   - fresh ingest, then re-run (should skip everything, `Nothing to do`)
   - a second source with a same-named but different file → collision, exit 1
@@ -249,12 +248,12 @@ with its `.XML` and `.sha256` sidecars into the folder matching its
 ## Next steps / open threads
 
 - Script handles `.MP4` clips plus their matching Sony XML sidecars
-  (case-insensitive). If the user starts shooting RAW, the
+  (case-insensitive). To support RAW or other Sony formats, the
   `find ... -iname "*.mp4"` filter and folder templating will need
   extending.
 - Sony proxies (`SUB/C0001S01.MP4`) are now explicitly detected and skipped
   with a reported count, rather than ingested as if they were originals. If
-  the user ever wants proxies kept, the decided-but-unbuilt option was a
+  proxies are ever wanted, the decided-but-unbuilt option was a
   `<date>/Proxy/` subfolder so they can't be confused with the real clips.
 - Known wrinkle: a clip's `.XML` sidecar is planned independently of the
   clip, so when a clip is refused as a `COLLISION` its sidecar is still
@@ -262,14 +261,12 @@ with its `.XML` and `.sha256` sidecars into the folder matching its
   self-heals on the next run once the collision is resolved; the run exits 1
   and says not to format the card either way. Fix by having the intra-plan
   pass demote a sidecar whose clip collided, if it ever becomes annoying.
-- Gyro detection is presence-only (`MetaFormat` contains `rtmd`). **It has
-  not yet been validated against real FX3 footage** — no clips or card were
-  available when it was written, and `~/Movies/Projects` is now empty. First
-  real ingest should sanity-check that normally-shot clips are *not* flagged,
-  and cross-check one flagged clip in Gyroflow.
-- No multi-destination (simultaneous backup) cloning — the user confirmed
-  they don't need this, so it hasn't been built.
-- No reel/card-ID folder level. Considered and declined 2026-07-27: the FX3
+- Gyro detection is presence-only (`MetaFormat` contains `rtmd`), and
+  validated against real FX3 footage. It does not confirm the samples are
+  populated — see the rejected deep check above.
+- No multi-destination (simultaneous backup) cloning — deliberately out of
+  scope; a single destination keeps the copy path simple.
+- No reel/card-ID folder level. Considered and declined: the FX3
   writes no usable card identifier (`serialNo` is `4294967295` = unset,
   `umidRef` is per-clip), so it would have to come from the SD volume name or
   a `--reel` flag. Collisions are caught at ingest instead. Revisit only if
@@ -277,3 +274,5 @@ with its `.XML` and `.sha256` sidecars into the folder matching its
 - Resolve's Media Pool auto-bin step (right-click → Auto-Bin by Metadata, or
   drag folders in directly) is the intended next step after ingest, but is a
   manual step in Resolve itself, not part of this script.
+- Same-day multi-card shoots are handled by collision detection rather than
+  structurally; revisit the reel-folder question if they become routine.
