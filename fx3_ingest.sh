@@ -45,15 +45,16 @@ usage() {
   echo ""
   echo -e "${CYAN}Usage:${NC}"
   echo "  $0 [--dry-run] <source_dir> <destination_dir>"
-  echo "  $0 --verify <archive_dir|date_folder|file>"
+  echo "  $0 --verify <archive_dir|date_folder>"
   echo ""
   echo "  source_dir       SD card clip folder (e.g. /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP)"
   echo "  destination_dir  Project footage root (e.g. /Volumes/MyDrive/Projects/Shoot/Footage)"
   echo ""
   echo "  -n, --dry-run    Show what would be copied, where, and why. Writes nothing."
   echo "      --verify     Re-hash against .sha256 sidecars and report corruption,"
-  echo "                   missing files, and missing sidecars. Takes a whole archive,"
-  echo "                   a single date folder, or one file (or its .sha256)."
+  echo "                   missing files, and missing sidecars. Takes a whole archive"
+  echo "                   or a single date folder. For one clip: cd to its folder and"
+  echo "                   run 'shasum -a 256 -c C0001.MP4.sha256'."
   echo "  -V, --version    Print the version and exit."
   echo "  -h, --help       Show this help."
   echo ""
@@ -72,7 +73,6 @@ while [ "$#" -gt 0 ]; do
     --verify)     MODE="verify"; shift ;;
     -h|--help)    usage; exit 0 ;;
     -V|--version) echo "fx3_ingest.sh $FX3_INGEST_VERSION"; exit 0 ;;
-    --)           shift; while [ "$#" -gt 0 ]; do positional+=("$1"); shift; done ;;
     -*)           echo -e "${RED}Error:${NC} Unknown option: $1"; echo ""; usage; exit 1 ;;
     *)            positional+=("$1"); shift ;;
   esac
@@ -131,12 +131,9 @@ log() {
   echo -e "$1"
 }
 
-# Same guard for the standalone bar-clearing calls between sections.
-clear_progress() {
-  if [ "$IS_TTY" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
-    printf "\r\033[K"
-  fi
-}
+# Same guard for the standalone bar-clearing calls between sections. (No
+# DRY_RUN check: a dry run exits before every caller, and verify never sets it.)
+clear_progress() { [ "$IS_TTY" -eq 1 ] && printf "\r\033[K"; return 0; }
 
 # stat wrappers — BSD/macOS syntax
 file_size()  { stat -f%z "$1"; }
@@ -151,7 +148,7 @@ file_mtime() { stat -f%m "$1"; }
 # skips (see the fast-skip note in plan_actions).
 if [ "$MODE" = "verify" ]; then
   if [ "${#positional[@]}" -ne 1 ]; then
-    echo -e "${RED}Error:${NC} --verify takes exactly one argument (an archive directory, a date folder, or a single file)"
+    echo -e "${RED}Error:${NC} --verify takes exactly one argument (an archive directory or a date folder)"
     echo ""
     usage
     exit 1
@@ -159,14 +156,10 @@ if [ "$MODE" = "verify" ]; then
 
   v_ok=0; v_bad=0; v_missing=0; v_nosidecar=0
 
-  # Re-hash one file against its sidecar. Shared by the whole-archive walk and
-  # the single-file path so there is only one copy of the hashing, the
-  # reporting, and the progress accounting.
-  # $3=1 logs successes too. A whole-archive walk stays quiet on success (the
-  # progress bar is the feedback, and one line per file would bury the
-  # failures); a single-file spot check has no bar, so it says so explicitly.
+  # Re-hash one file against its sidecar. Stays quiet on success — the progress
+  # bar is the feedback, and one line per file would bury the failures.
   verify_sidecar() {
-    local sidecar="$1" root="$2" verbose="${3:-0}"
+    local sidecar="$1" root="$2"
     local orig rel stored_hash actual_hash
     orig="${sidecar%.sha256}"
     rel="${orig#"$root"/}"
@@ -179,7 +172,6 @@ if [ "$MODE" = "verify" ]; then
     stored_hash=$(awk 'NR==1 {print $1}' "$sidecar")
     actual_hash=$(shasum -a 256 "$orig" | awk '{print $1}')
     if [ "$stored_hash" = "$actual_hash" ]; then
-      [ "$verbose" -eq 1 ] && log "${GREEN}✓${NC} OK:             $rel"
       v_ok=$((v_ok + 1))
     else
       log "${RED}✗${NC} CORRUPT:        $rel  (hash does not match sidecar)"
@@ -190,42 +182,18 @@ if [ "$MODE" = "verify" ]; then
     draw_progress
   }
 
-  TARGET="${positional[0]%/}"
-
-  # ── Single file ────────────────────────────────────────────────────────────
-  # Accept either the file itself or its sidecar; spot-checking one clip
-  # shouldn't require re-hashing the terabytes around it.
-  if [ -f "$TARGET" ]; then
-    case "$TARGET" in
-      *.sha256) SIDECAR="$TARGET" ;;
-      *)        SIDECAR="${TARGET}.sha256" ;;
-    esac
-    if [ ! -f "$SIDECAR" ]; then
-      echo -e "${RED}Error:${NC} No checksum sidecar for this file: $SIDECAR"
-      echo "  Only files ingested by this script have one."
-      exit 1
-    fi
-    ARCHIVE=$(dirname "$SIDECAR")
-
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}  FX3 Verify${NC}"
-    echo -e "${CYAN}  File:${NC} ${SIDECAR%.sha256}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-
-    verify_sidecar "$SIDECAR" "$ARCHIVE" 1
-
-    clear_progress
-    if [ "$v_bad" -gt 0 ] || [ "$v_missing" -gt 0 ]; then
-      exit 1
-    fi
-    exit 0
-  fi
-
-  # ── Whole archive (or one date folder — it's just a directory) ─────────────
-  ARCHIVE="$TARGET"
+  # A whole archive, or one date folder — it's just a directory. Spot-checking a
+  # single clip is `cd <folder> && shasum -a 256 -c C0001.MP4.sha256`.
+  ARCHIVE="${positional[0]%/}"
   if [ ! -d "$ARCHIVE" ]; then
-    echo -e "${RED}Error:${NC} Not found: $ARCHIVE"
+    # --verify used to take a single file. Point that habit at shasum rather
+    # than reporting an existing file as "not found".
+    if [ -f "$ARCHIVE" ]; then
+      echo -e "${RED}Error:${NC} --verify takes a directory. To check one file:"
+      echo "  cd $(dirname "$ARCHIVE") && shasum -a 256 -c $(basename "${ARCHIVE%.sha256}").sha256"
+    else
+      echo -e "${RED}Error:${NC} Not found: $ARCHIVE"
+    fi
     exit 1
   fi
 
@@ -235,33 +203,44 @@ if [ "$MODE" = "verify" ]; then
   echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
 
-  # Pre-scan for progress totals: bytes of every file that has a sidecar.
-  while IFS= read -r -d '' sidecar; do
-    orig="${sidecar%.sha256}"
-    if [ -f "$orig" ]; then
-      total_files=$((total_files + 1))
-      total_bytes=$((total_bytes + $(file_size "$orig")))
-    fi
-  done < <(find "$ARCHIVE" -name "*.sha256" -type f -print0 | sort -z)
+  # One walk of the archive, reused for the totals, the orphan check, and the
+  # hashing — an archive big enough to want a progress bar is big enough not to
+  # walk three times. NUL-delimited into a file rather than an array: bash 3.2,
+  # and a path may contain anything but NUL.
+  FILE_LIST=$(mktemp "${TMPDIR:-/tmp}/fx3_verify.XXXXXX")
+  trap 'rm -f "$FILE_LIST"' EXIT
+  find "$ARCHIVE" -type f -print0 | sort -z > "$FILE_LIST"
+
+  # Pass 1: progress totals, plus files that never got a sidecar written. macOS
+  # scatters .DS_Store files through any browsed folder; they aren't media and
+  # would be pure noise here.
+  while IFS= read -r -d '' f; do
+    case "$f" in
+      *.sha256)
+        orig="${f%.sha256}"
+        if [ -f "$orig" ]; then
+          total_files=$((total_files + 1))
+          total_bytes=$((total_bytes + $(file_size "$orig")))
+        fi
+        ;;
+      *.part|*/.DS_Store) ;;
+      *)
+        if [ ! -f "${f}.sha256" ]; then
+          log "${YELLOW}!${NC} NO SIDECAR:     ${f#"$ARCHIVE"/}"
+          v_nosidecar=$((v_nosidecar + 1))
+        fi
+        ;;
+    esac
+  done < "$FILE_LIST"
 
   draw_progress
 
-  while IFS= read -r -d '' sidecar; do
-    verify_sidecar "$sidecar" "$ARCHIVE"
-  done < <(find "$ARCHIVE" -name "*.sha256" -type f -print0 | sort -z)
-
-  # Files in the archive that never got a sidecar written. macOS scatters
-  # .DS_Store files through any browsed folder; they aren't media and would
-  # be pure noise here.
+  # Pass 2: re-hash everything that has a sidecar.
   while IFS= read -r -d '' f; do
     case "$f" in
-      *.sha256|*.part|*/.DS_Store) continue ;;
+      *.sha256) verify_sidecar "$f" "$ARCHIVE" ;;
     esac
-    if [ ! -f "${f}.sha256" ]; then
-      log "${YELLOW}!${NC} NO SIDECAR:     ${f#"$ARCHIVE"/}"
-      v_nosidecar=$((v_nosidecar + 1))
-    fi
-  done < <(find "$ARCHIVE" -type f -print0 | sort -z)
+  done < "$FILE_LIST"
 
   clear_progress
   echo ""
@@ -302,11 +281,11 @@ if ! command -v exiftool &>/dev/null; then
 fi
 
 # ── Counters ──────────────────────────────────────────────────────────────────
+# Only what execution actually determines. Skips, duplicates and collisions are
+# fixed by the plan and never diverge from it, so the summary reads those off
+# the plan totals rather than recounting them during the walk.
 count_copied=0
-count_skipped=0
 count_failed=0
-count_collision=0
-count_dupe=0
 count_nogyro=0
 
 # Scratch dir for the plan file and exiftool argfile. Also holds the path of
@@ -429,12 +408,10 @@ while IFS=$'\t' read -r nrt_date qt_date meta_format; do
 done < "$exif_out"
 
 # If exiftool bailed entirely, fall back to per-file resolution below. Gyro
-# state is unknown in that case rather than absent — don't cry wolf.
+# state is unknown in that case rather than absent — don't cry wolf. The two
+# arrays are appended in lockstep above, so one loop pads both.
 while [ "${#dates[@]}" -lt "${#src_files[@]}" ]; do
-  dates+=("")
-done
-while [ "${#gyro[@]}" -lt "${#src_files[@]}" ]; do
-  gyro+=("unknown")
+  dates+=(""); gyro+=("unknown")
 done
 
 # ── Build the plan ───────────────────────────────────────────────────────────
@@ -774,12 +751,10 @@ while IFS=$'\t' read -r action src dst_dir size mtime has_gyro reason; do
   case "$action" in
     SKIP)
       log "${YELLOW}—${NC} Skipping (already ingested):  $rel/$name"
-      count_skipped=$((count_skipped + 1))
       ;;
     DUPLICATE)
       log "${YELLOW}—${NC} Skipping (duplicate source):  $rel/$name"
       log "    $reason"
-      count_dupe=$((count_dupe + 1))
       ;;
     COLLISION)
       case "$reason" in
@@ -794,7 +769,6 @@ while IFS=$'\t' read -r action src dst_dir size mtime has_gyro reason; do
           log "    second card into a different destination folder, or rename one."
           ;;
       esac
-      count_collision=$((count_collision + 1))
       ;;
     COPY)
       ingest_file "$src" "$dst_dir" "$rel" "$has_gyro"
@@ -815,9 +789,9 @@ fi
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "  ${GREEN}Copied & verified:${NC}  $count_copied"
-echo -e "  ${YELLOW}Skipped (existing):${NC} $count_skipped"
-if [ "$count_dupe" -gt 0 ]; then
-  echo -e "  ${YELLOW}Duplicate sources:${NC}  $count_dupe"
+echo -e "  ${YELLOW}Skipped (existing):${NC} $plan_skip"
+if [ "$plan_dupe" -gt 0 ]; then
+  echo -e "  ${YELLOW}Duplicate sources:${NC}  $plan_dupe"
 fi
 if [ "$count_nogyro" -gt 0 ]; then
   echo -e "  ${YELLOW}Without gyro data:${NC}  $count_nogyro"
@@ -825,15 +799,15 @@ fi
 if [ "$count_proxy" -gt 0 ]; then
   echo -e "  ${YELLOW}Proxies skipped:${NC}    $count_proxy"
 fi
-if [ "$count_collision" -gt 0 ]; then
-  echo -e "  ${RED}Name collisions:${NC}    $count_collision  ${RED}(NOT copied)${NC}"
+if [ "$plan_collide" -gt 0 ]; then
+  echo -e "  ${RED}Name collisions:${NC}    $plan_collide  ${RED}(NOT copied)${NC}"
 fi
 if [ "$count_failed" -gt 0 ]; then
   echo -e "  ${RED}Failed:${NC}             $count_failed"
 fi
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-if [ "$count_failed" -gt 0 ] || [ "$count_collision" -gt 0 ]; then
+if [ "$count_failed" -gt 0 ] || [ "$plan_collide" -gt 0 ]; then
   echo -e "${RED}Do not format the card — some files were not ingested.${NC}"
   exit 1
 fi

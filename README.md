@@ -152,20 +152,20 @@ anything is wrong, so it's cron-friendly:
 ./fx3_ingest.sh --verify /Volumes/MyDrive/Projects/Shoot_Name/Footage
 ```
 
-It also takes a single date folder, or one file, when you want a spot check
-rather than a full re-hash of the archive:
+It also takes a single date folder, when you want to spot check one day rather
+than re-hash the whole archive:
 
 ```bash
 ./fx3_ingest.sh --verify ~/Footage/2026-07-20              # one day
-./fx3_ingest.sh --verify ~/Footage/2026-07-20/C0001.MP4    # one clip
 ```
 
-To check a file with `shasum` directly instead, note that `shasum -c`
-resolves the filename in the sidecar relative to the **current directory**,
-not to the sidecar's location — so you have to be in the file's folder:
+For a single clip, use `shasum` directly — the sidecars are in its standard
+format. Note that `shasum -c` resolves the filename in the sidecar relative to
+the **current directory**, not to the sidecar's location, so you have to be in
+the file's folder:
 
 ```bash
-cd /path/to/2026-07-20 && shasum -a 256 -c C0001.MP4.sha256
+cd ~/Footage/2026-07-20 && shasum -a 256 -c C0001.MP4.sha256
 ```
 
 ## Date handling
