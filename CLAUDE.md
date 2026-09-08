@@ -189,14 +189,14 @@ chmod +x fx3_ingest.sh
 ./fx3_ingest.sh --dry-run <source_dir> <destination_dir>   # preview, writes nothing
 ./fx3_ingest.sh --verify <archive_dir>                     # re-hash a whole archive
 ./fx3_ingest.sh --verify <archive_dir>/2026-07-20          # one date folder
-./fx3_ingest.sh --verify <archive_dir>/2026-07-20/C0001.MP4  # one clip (or its .sha256)
 ./fx3_ingest.sh --version                                  # print version
 
 # Example:
 ./fx3_ingest.sh /Volumes/SDCARD/PRIVATE/M4ROOT/CLIP /Volumes/MyDrive/Projects/Shoot_Name/Footage
 ```
 
-Re-verifying a single archived clip by hand. Note `shasum -c` resolves the
+Re-verifying a single archived clip is `shasum`'s job, not the script's —
+`--verify` takes a directory only. Note `shasum -c` resolves the
 filename in the sidecar relative to the **current directory**, not to the
 sidecar's location, so you must be in the file's folder — the previously
 documented `shasum -a 256 -c /path/to/clip.MP4.sha256` does not work:
